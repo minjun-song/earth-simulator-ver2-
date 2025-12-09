@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>지구 열수지 시뮬레이터 - 알베도 조절 & 퀴즈 & 지구온난화</title>
+  <style>
+    body {
+      margin: 0;
+      background: #f4f4f4;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-family: sans-serif;
+    }
+    #controls {
+      background: white;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+    }
+    #simCanvas {
+      margin-top: 10px;
+      border: 1px solid #ccc;
+      background: white;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 모드 선택 드롭다운 -->
+  <div style="margin-top:10px;">
+    <label><b>모드 선택 :</b> </label>
+    <select id="modeSelect" style="padding:6px; font-size:16px;">
+      <option value="basic">기본 모드</option>
+      <option value="quiz">퀴즈 모드</option>
+      <option value="warming">지구온난화 모드</option>
+    </select>
+  </div>
+
+  <!-- 퀴즈 버튼 (퀴즈 모드에서만 표시) -->
+  <button id="quizBtn" style="display:none; margin-top:10px; padding:8px 14px; font-size:16px; cursor:pointer;">퀴즈 생성</button>
+
+  <!-- 상단: 체크박스 + 슬라이더 + 세 영역 평형 패널 -->
+  <div style="display:flex; gap:20px; align-items:flex-start; margin-top:10px;">
+
+    <!-- 대기 포함 체크박스 (기본 모드에서만 사용) -->
+    <div id="atmToggleContainer" style="display:flex; flex-direction:column; justify-content:flex-start; padding-top:20px;">
+      <label><input type="checkbox" id="atmEnabled" checked> 대기 포함</label>
+    </div>
+
+    <!-- 알베도 슬라이더 (기본/퀴즈에서 사용) -->
+    <div id="controls" style="height:150px; display:flex; flex-direction:column; justify-content:center; border:2px solid transparent;">
+      <label>대기 반사(%) : <span id="atmRefVal">25</span>%</label><br>
+      <input type="range" id="atmRef" min="0" max="60" value="25" />
+      <br><br>
+      <label>지표 반사(%) : <span id="surfRefVal">5</span>%</label><br>
+      <input type="range" id="surfRef" min="0" max="40" value="5" />
+    </div>
+
+    <!-- 지구온난화 슬라이더 (warming 모드에서만 사용) -->
+    <div id="warmingControls" style="display:none; background:#fff; padding:10px; border:1px solid #ccc; border-radius:8px; height:150px; width:200px;">
+      <label>온실가스(G) : <span id="ghgVal">0</span></label><br>
+      <input type="range" id="ghgSlider" min="0" max="100" value="0" />
+    </div>
+
+    <!-- 세 영역 평형 패널 -->
+    <div id="summaryPanel" style="padding:10px; background:#fff; border:1px solid #ccc; border-radius:8px; width:400px; font-size:16px; height:150px; display:flex; flex-direction:column; justify-content:center;">
+      <div><b>우주 영역 평형:</b> <span id="spaceBal">0</span> <span id="spaceExp" style="color:#555"></span></div>
+      <div><b>대기 영역 평형:</b> <span id="atmBal">0</span> <span id="atmExp" style="color:#555"></span></div>
+      <div><b>지표 영역 평형:</b> <span id="surfBal">0</span> <span id="surfExp" style="color:#555"></span></div>
+    </div>
+
+  </div>
+
+  <!-- 퀴즈 입력 패널 (캔버스 위) -->
+  <div id="quizUI_container"></div>
+
+  <!-- 메인 시뮬레이터 캔버스 -->
+  <canvas id="simCanvas" width="1400" height="600"></canvas>
+
+  <script>
+    const canvas = document.getElementById("simCanvas");
+    const ctx = canvas.getContext("2d");
+
+    const atmSlider = document.getElementById("atmRef");
+    const atmVal = document.getElementById("atmRefVal");
+    const surfSlider = document.getElementById("surfRef");
+    const surfVal = document.getElementById("surfRefVal");
+    const modeSelect = document.getElementById("modeSelect");
+    const quizBtn = document.getElementById("quizBtn");
+    const atmToggleContainer = document.getElementById("atmToggleContainer");
+    const atmEnabledCheckbox = document.getElementById("atmEnabled");
+    const ghgSlider = document.getElementById("ghgSlider");
+    const ghgVal = document.getElementById("ghgVal");
+
+    let isQuizMode = false;
+    let hasQuizData = false;
+
+    // 퀴즈용 정답 값 (A,B,C) 및 마스킹 대상
+    let quizMaskTarget = null; // "atm" 또는 "surf"
+    let quizAtmRef = null;     // 대기 반사 값
+    let quizSurfRef = null;    // 지표 반사 값
+    let quizB = null;          // 대기 흡수 (태양복사)
+    let quizC = null;          // 지표·흡수 (장파복사)
+
+    // 상태 값
+    let atmEnabled = true; // "대기 포함" 체크박스 상태
+
+    let state = {
+      atmRef: 25,       // 대기 반사
+      surfRef: 5,       // 지표 반사
+      atmAbs: 0,        // 대기 단파 흡수(SA)
+      surfAbs: 0,       // 지표 단파 흡수(SS)
+      atmEmitUp: 66,    // 대기 상향 장파 방출
+      atmEmitDown: 88,  // 대기 하향 장파 방출(지표·흡수)
+      E: 133,           // 지구복사에너지
+      SA: 0,            // 편의상 저장
+      SS: 0
+    };
+
+    // === 기본 모드 계산 ===
+    function computeBasicMode() {
+      const totalIncoming = 100;
+
+      // 대기 비포함 모드 (체크박스 해제) → 단순화된 구조
+      if (!atmEnabled) {
+        state.atmRef = 0;      // 대기 반사 없음
+        state.surfRef = 0;     // 지표 반사 없음
+        state.atmAbs = 0;      // 대기 흡수 없음
+        state.surfAbs = 100;   // 태양복사 100 전부 지표에 흡수
+
+        state.SA = 0;
+        state.SS = 100;
+
+        // 대기 없음 → 장파는 지표에서 바로 우주로 100 방출
+        state.atmEmitUp = 0;
+        state.atmEmitDown = 0;
+        state.E = 100;
+        return;
+      }
+
+      // 대기 포함 일반 기본 모드 (슬라이더 값 사용)
+      const atmRef = Number(atmSlider.value);
+      const surfRef = Number(surfSlider.value);
+
+      state.atmRef = atmRef;
+      state.surfRef = surfRef;
+
+      const totalAbsorb = totalIncoming - (atmRef + surfRef);
+      state.atmAbs = Math.round(totalAbsorb * 0.35);
+      state.surfAbs = totalAbsorb - state.atmAbs;
+
+      // 교과서 기본값 유지
+      state.atmEmitUp = 66;
+      state.atmEmitDown = 88;
+      state.E = 133;
+      state.SA = state.atmAbs;
+      state.SS = state.surfAbs;
+    }
+
+    // === 퀴즈 모드 계산 (기존 구조) ===
+    function computeQuizMode() {
+      if (!hasQuizData) return;
+
+      const totalIncoming = 100;
+      const D = 4; // 지표에서 우주로 바로 나가는 장파복사 고정 4
+
+      // 퀴즈에서 생성된 값들을 그대로 사용
+      state.atmRef = quizAtmRef;      // 대기 반사
+      state.surfRef = quizSurfRef;    // 지표 반사
+      state.atmAbs = quizB;           // 대기 흡수(SA)
+      state.surfAbs = totalIncoming - quizAtmRef - quizSurfRef - quizB; // 지표 단파 흡수(SS)
+
+      state.SA = state.atmAbs;
+      state.SS = state.surfAbs;
+
+      // C는 퀴즈 생성 시 한 번 정해진 값을 그대로 사용
+      const C = quizC != null ? quizC : 0;
+
+      // 지표 영역 평형: 지표 단파 흡수(SS) + 대기 방출 하향(C) = 지구복사 총량(E)
+      state.E = state.SS + C;
+      state.atmEmitDown = C;  // 대기 → 지표 장파복사 (지표·흡수 C)
+
+      // 우주 영역 평형: -100 + RA + RS + 4 + atmEmitUp = 0
+      state.atmEmitUp = 100 - (state.atmRef + state.surfRef + D);
+    }
+
+    // === 지구온난화 모드 계산 ===
+    function computeWarmingMode() {
+      const G = Number(ghgSlider.value);
+
+      // 알베도 고정 (대기 25, 지표 5)
+      state.atmRef = 25;
+      state.surfRef = 5;
+
+      // 단파(태양복사) 흡수는 교과서 기본값 유지 (SA=25, SS=45)
+      state.atmAbs = 25;  // SA
+      state.surfAbs = 45; // SS
+      state.SA = state.atmAbs;
+      state.SS = state.surfAbs;
+
+      // 장파(지구복사) 구조: 지구복사 총량과 대기 방출 값이 G에 따라 증가
+      state.E = 133 + G;                 // 지구복사에너지
+      state.atmEmitDown = state.E - 45;  // 지표로 향하는 대기 방출 (88 + G)
+
+      const directLW = 4;                // 지표에서 우주로 직접 나가는 장파복사 (고정)
+      const lwAbsorb = state.E - directLW; // 대기가 흡수하는 장파복사 (129 + G)
+
+      // 대기 에너지 평형: SA + 장파흡수 = 상향방출 + 하향방출
+      state.atmEmitUp = state.SA + lwAbsorb - state.atmEmitDown; // 항상 66 유지
+    }
+
+    // === 퀴즈 입력 UI 생성 ===
+    const quizUI = document.createElement("div");
+    quizUI.style.marginTop = "10px";
+    quizUI.style.padding = "10px";
+    quizUI.style.background = "#fff";
+    quizUI.style.border = "1px solid #ccc";
+    quizUI.style.borderRadius = "8px";
+    quizUI.style.width = "420px";
+    quizUI.innerHTML = `
+      <b>퀴즈 정답 입력</b><br><br>
+      A (반사) : <input id="inputA" type="number" style="width:80px;"> <span id="resA"></span><br><br>
+      B (대기 흡수) : <input id="inputB" type="number" style="width:80px;"> <span id="resB"></span><br><br>
+      C (지표 흡수) : <input id="inputC" type="number" style="width:80px;"> <span id="resC"></span><br><br>
+      <button id="checkBtn" style="padding:6px 12px; cursor:pointer;">정답 확인</button>
+    `;
+    document.getElementById("quizUI_container").appendChild(quizUI);
+
+    // === 레이아웃 그리기 ===
+    function drawLayout() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const zoneHeight = canvas.height / 3;
+
+      // 우주 영역
+      ctx.fillStyle = "#e9f1ff";
+      ctx.fillRect(0, 0, canvas.width, zoneHeight);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, 0, canvas.width, zoneHeight);
+      ctx.fillStyle = "#003366";
+      ctx.font = "28px Arial";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("우주 (Space)", canvas.width * 0.39, zoneHeight / 2);
+
+      // 대기 영역
+      ctx.fillStyle = "#eaf7ff";
+      ctx.fillRect(0, zoneHeight, canvas.width, zoneHeight);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, zoneHeight, canvas.width, zoneHeight);
+      ctx.fillStyle = "#005588";
+      ctx.font = "28px Arial";
+      ctx.fillText("대기 (Atmosphere)", canvas.width * 0.39, zoneHeight + zoneHeight / 2);
+
+      // 대기 방출 텍스트 위치
+      ctx.font = "16px Arial";
+      ctx.fillStyle = "#000";
+      ctx.textAlign = "center";
+      ctx.fillText("대기 방출", canvas.width * 0.80, zoneHeight + zoneHeight / 2);
+
+      // 지표 영역
+      ctx.fillStyle = "#fff7e6";
+      ctx.fillRect(0, zoneHeight * 2, canvas.width, zoneHeight);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, zoneHeight * 2, canvas.width, zoneHeight);
+      ctx.fillStyle = "#aa6600";
+      ctx.font = "28px Arial";
+      ctx.fillText("지표 (Surface)", canvas.width * 0.39, zoneHeight * 2 + zoneHeight / 2);
+
+      // soil 레이어
+      const soilHeight = 30;
+      ctx.fillStyle = "#c7924a";
+      ctx.fillRect(0, zoneHeight * 3 - soilHeight, canvas.width, soilHeight);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, zoneHeight * 3 - soilHeight, canvas.width, soilHeight);
+    }
+
+    // === 기본 선/화살표 그리기 함수 ===
+    function drawArrow(x1, y1, x2, y2, color = "red", width = 4) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      const angle = Math.atan2(y2 - y1, x2 - x1);
+      const headSize = 20;
+      ctx.beginPath();
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(
+        x2 - headSize * Math.cos(angle - Math.PI / 6),
+        y2 - headSize * Math.sin(angle - Math.PI / 6)
+      );
+      ctx.lineTo(
+        x2 - headSize * Math.cos(angle + Math.PI / 6),
+        y2 - headSize * Math.sin(angle + Math.PI / 6)
+      );
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    function drawLine(x1, y1, x2, y2, color = "red", width = 4) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+
+    // === 화살표/에너지 흐름 그리기 ===
+    function drawArrows() {
+      const zoneHeight = canvas.height / 3;
+      const soilHeight = 30;
+
+      const atmLabelX = canvas.width * 0.80;
+      const atmLabelY = zoneHeight + zoneHeight / 2;
+
+      const midX = canvas.width * 0.24;
+      const totalIncoming = 100;
+
+      const mode = modeSelect.value;
+
+      // 상태에서 값 읽기
+      let atmRef = state.atmRef;
+      let surfRef = state.surfRef;
+      let atmAbs = state.atmAbs;
+      let surfAbs = state.surfAbs;
+      let atmEmitUp = state.atmEmitUp;
+      let atmEmitDown = state.atmEmitDown;
+      let E = state.E;
+
+      // 슬라이더 표시값 업데이트 (warming 모드는 고정값이라도 표시용으로 state 기준)
+      atmVal.textContent = atmRef;
+      surfVal.textContent = surfRef;
+
+      const startX = midX;
+      const startY = zoneHeight / 2;
+
+      // 태양복사에너지 라벨 (100 고정)
+      ctx.fillStyle = "#000";
+      ctx.font = "18px Arial";
+      ctx.textAlign = "center";
+      ctx.fillText(`태양복사에너지 (100)`, startX, startY - 25);
+
+      const soilTopY = zoneHeight * 3 - soilHeight;
+      drawArrow(startX, startY, midX, soilTopY, "red", 4);
+
+      // 지표 단파 흡수
+      ctx.font = "16px Arial";
+      ctx.textAlign = "left";
+      ctx.fillText(`흡수(${surfAbs})`, midX + 10, soilTopY - 10);
+
+      // 대기 관련 화살표를 그릴지 여부 (warming 모드에서는 항상 대기 있음으로 간주)
+      const hasAtmosphere = atmEnabled || isQuizMode || mode === "warming";
+
+      if (hasAtmosphere) {
+        // 대기 단파 흡수 (B 또는 숫자)
+        const branchY = zoneHeight + zoneHeight * 0.35;
+        const absorbEndX = midX + 70;
+        const absorbEndY = branchY + 40;
+        drawArrow(midX, branchY, absorbEndX, absorbEndY, "red", 4);
+        ctx.textAlign = "center";
+        if (isQuizMode && hasQuizData) {
+          ctx.fillText(`B`, absorbEndX, absorbEndY + 20);
+        } else {
+          ctx.fillText(`흡수(${atmAbs})`, absorbEndX, absorbEndY + 20);
+        }
+
+        // 대기 반사
+        const boundaryY = zoneHeight;
+        const reflectMidX = midX - 100;
+        const reflectMidY = boundaryY + 60;
+        drawLine(midX, boundaryY, reflectMidX, reflectMidY, "red", 4);
+        drawArrow(reflectMidX, reflectMidY, midX - 170, startY - 5, "red", 4);
+
+        ctx.textAlign = "center";
+        if (isQuizMode && hasQuizData && quizMaskTarget === "atm") {
+          ctx.fillText(`A`, midX - 170, startY - 15);
+        } else {
+          ctx.fillText(`반사(${atmRef})`, midX - 170, startY - 15);
+        }
+
+        // 지표 반사
+        const surfaceReflectY = zoneHeight * 2 + zoneHeight * 0.5;
+        const soilTop = zoneHeight * 3 - soilHeight;
+        const soilY = soilTop - 2;
+        const surfReflectMidX = midX - 70;
+        drawLine(midX, surfaceReflectY, surfReflectMidX, soilY, "red", 4);
+        drawArrow(surfReflectMidX, soilY, midX - 270, startY + 5, "red", 4);
+
+        if (isQuizMode && hasQuizData && quizMaskTarget === "surf") {
+          ctx.fillText(`A`, midX - 270, startY - 15);
+        } else {
+          ctx.fillText(`반사(${surfRef})`, midX - 270, startY - 15);
+        }
+      }
+
+      // 지구복사 (지표 → 우주)
+      const lwStartX = canvas.width * 0.50;
+      const lwStartY = zoneHeight * 3 - soilHeight;
+      const lwEndY = zoneHeight * 0.5;
+      drawArrow(lwStartX, lwStartY, lwStartX, lwEndY, "blue", 4);
+
+      ctx.fillStyle = "#000";
+      ctx.font = "16px Arial";
+      ctx.textAlign = "center";
+
+      // 우주로 직접 나가는 부분 표시
+      if (!hasAtmosphere && !isQuizMode && mode !== "warming") {
+        ctx.fillText("100", lwStartX, lwEndY - 10);
+      } else {
+        // 기본/퀴즈/온난화 모두 4로 고정 (direct LW)
+        ctx.fillText("4", lwStartX, lwEndY - 10);
+      }
+
+      ctx.textAlign = "left";
+      ctx.fillText(`지구복사에너지 (${E})`, lwStartX + 10, lwStartY - 10);
+
+      // 대기 포함(또는 퀴즈/온난화) 시에만 대기 흡수/방출 구조 표시
+      if (hasAtmosphere) {
+        // 대기에서 90도 우측 분기 (지구복사 흡수)
+        const atmBranchY = zoneHeight * 1.5;
+        const atmBranchX = lwStartX;
+        const atmBranchEndX = lwStartX + 120;
+        drawArrow(atmBranchX, atmBranchY, atmBranchEndX, atmBranchY, "blue", 4);
+        ctx.font = "16px Arial";
+        ctx.textAlign = "left";
+
+        if (isQuizMode && hasQuizData) {
+          const lwAbs = Math.max(0, E - 4);
+          ctx.fillText(`흡수(${lwAbs})`, atmBranchEndX + 10, atmBranchY + 5);
+        } else if (mode === "warming") {
+          const lwAbs = Math.max(0, E - 4);
+          ctx.fillText(`흡수(${lwAbs})`, atmBranchEndX + 10, atmBranchY + 5);
+        } else {
+          ctx.fillText("흡수(129)", atmBranchEndX + 10, atmBranchY + 5);
+        }
+
+        // 대기 방출 → 우주 (녹색)
+        const atmToSpaceEndY = zoneHeight * 0.5;
+        const atmLabelTopY = atmLabelY - 20;
+        drawArrow(atmLabelX, atmLabelTopY, atmLabelX, atmToSpaceEndY, "green", 4);
+        ctx.font = "16px Arial";
+        ctx.fillStyle = "#000";
+        ctx.textAlign = "center";
+        ctx.fillText(String(atmEmitUp), atmLabelX, atmToSpaceEndY - 10);
+
+        // 대기 방출 → 지표(soil) (녹색)
+        const soilTopY2 = zoneHeight * 3 - soilHeight;
+        const atmLabelBottomY = atmLabelY + 20;
+        drawArrow(atmLabelX, atmLabelBottomY, atmLabelX, soilTopY2, "green", 4);
+        ctx.font = "16px Arial";
+        ctx.fillStyle = "#000";
+        ctx.textAlign = "left";
+        if (isQuizMode && hasQuizData) {
+          ctx.fillText("C", atmLabelX + 20, soilTopY2 - 5);
+        } else {
+          ctx.fillText(`지표·흡수(${atmEmitDown})`, atmLabelX + 20, soilTopY2 - 5);
+        }
+      }
+    }
+
+    // === 렌더링 ===
+    function render() {
+      const mode = modeSelect.value;
+
+      // 모드별 계산
+      if (mode === "warming") {
+        computeWarmingMode();
+      } else if (isQuizMode) {
+        computeQuizMode();
+      } else {
+        computeBasicMode();
+      }
+
+      drawLayout();
+      drawArrows();
+
+      // 기본 모드 및 지구온난화 모드에서 평형 패널 계산/표시
+      if (!isQuizMode) {
+        const spaceBalSpan = document.getElementById("spaceBal");
+        const spaceExpSpan = document.getElementById("spaceExp");
+        const atmBalSpan = document.getElementById("atmBal");
+        const atmExpSpan = document.getElementById("atmExp");
+        const surfBalSpan = document.getElementById("surfBal");
+        const surfExpSpan = document.getElementById("surfExp");
+
+        if (mode === "warming") {
+          // 지구온난화 모드: state 값을 기반으로 세 영역 평형 계산
+          const atmRef = state.atmRef;   // 25 고정
+          const surfRef = state.surfRef; // 5 고정
+          const directLW = 4;
+          const E = state.E;
+          const SA = state.atmAbs;       // 25
+          const SS = state.surfAbs;      // 45
+          const atmUp = state.atmEmitUp;
+          const atmDown = state.atmEmitDown;
+          const lwAbs = E - directLW;    // 대기 장파 흡수 (129+G)
+
+          // 우주 영역: -100(태양) + (반사 + 직접장파 + 대기상향방출) = 0
+          const spaceIn = atmRef + surfRef + directLW + atmUp;
+          const spaceBal = spaceIn - 100;
+          spaceBalSpan.textContent = spaceBal;
+          spaceExpSpan.textContent = ` (-100 = ${atmRef} + ${surfRef} + ${directLW} + ${atmUp})`;
+
+          // 대기 영역: SA + 장파흡수 = 상향방출 + 하향방출
+          const atmIn = SA + lwAbs;
+          const atmOut = atmUp + atmDown;
+          const atmBalCalc = atmIn - atmOut;
+          atmBalSpan.textContent = atmBalCalc;
+          atmExpSpan.textContent = ` (${SA}+${lwAbs} = ${atmUp}+${atmDown})`;
+
+          // 지표 영역: SS + 대기하향장파 = 지구복사에너지
+          const surfIn = SS + atmDown;
+          const surfOut = E;
+          const surfBalCalc = surfIn - surfOut;
+          surfBalSpan.textContent = surfBalCalc;
+          surfExpSpan.textContent = ` (${SS}+${atmDown} = ${E})`;
+        } else {
+          // 기본 모드(대기 포함/비포함)
+          if (!atmEnabled) {
+            // 대기 비포함 단순 모델
+            // 우주: -100(태양) + 100(지구복사) = 0
+            spaceBalSpan.textContent = 0;
+            spaceExpSpan.textContent = " (-100 = 100)";
+
+            // 대기: 에너지 출입 없음
+            atmBalSpan.textContent = 0;
+            atmExpSpan.textContent = " (0 = 0)";
+
+            // 지표: +100(태양 흡수) -100(지구복사 방출) = 0
+            surfBalSpan.textContent = 0;
+            surfExpSpan.textContent = " (100 = 100)";
+          } else {
+            const atmRef = Number(atmSlider.value);
+            const surfRef = Number(surfSlider.value);
+            const totalIncoming = 100;
+
+            // 우주 영역 평형 (기존 구조)
+            const spaceIn = atmRef + surfRef + 66 + 4;
+            const spaceBal = spaceIn - totalIncoming;
+            spaceBalSpan.textContent = spaceBal;
+            spaceExpSpan.textContent = ` (-100 = ${atmRef} + ${surfRef} + 4 + 66)`;
+
+            // 대기 영역 평형 (기존 설명값 기준)
+            const totalRef = atmRef + surfRef;
+            const totalAbsorb = totalIncoming - totalRef;
+            const atmAbs = Math.round(totalAbsorb * 0.35);
+            const atmIn = atmAbs + 129;
+            const atmOut = 66 + 88;
+            const atmBalCalc = atmIn - atmOut;
+            atmBalSpan.textContent = atmBalCalc;
+            atmExpSpan.textContent = ` (${atmAbs}+129 = 66+88)`;
+
+            // 지표 영역 평형 (기존 설명값 기준)
+            const surfAbs = totalAbsorb - atmAbs;
+            const surfIn = surfAbs + 88;
+            const surfOut = 133;
+            const surfBalCalc = surfIn - surfOut;
+            surfBalSpan.textContent = surfBalCalc;
+            surfExpSpan.textContent = ` (${surfAbs}+88 = 133)`;
+          }
+        }
+      }
+    }
+
+    // === 이벤트 바인딩 ===
+    atmSlider.oninput = render;
+    surfSlider.oninput = render;
+    ghgSlider.oninput = () => {
+      ghgVal.textContent = ghgSlider.value;
+      render();
+    };
+
+    atmEnabledCheckbox.onchange = (e) => {
+      atmEnabled = e.target.checked;
+      render();
+    };
+
+    // 모드 변경에 따른 UI 표시 토글
+    function updateMode() {
+      const mode = modeSelect.value;
+      isQuizMode = (mode === "quiz");
+
+      if (mode === "basic") {
+        quizBtn.style.display = "none";
+        quizUI.style.display = "none";
+        document.getElementById("controls").style.display = "flex";
+        document.getElementById("summaryPanel").style.display = "flex";
+        atmToggleContainer.style.display = "flex"; // 기본 모드에서만 대기 포함 체크박스 표시
+        document.getElementById("warmingControls").style.display = "none";
+      } else if (mode === "quiz") {
+        quizBtn.style.display = "block";
+        quizUI.style.display = "block";
+        document.getElementById("controls").style.display = "none";
+        document.getElementById("summaryPanel").style.display = "none";
+        atmToggleContainer.style.display = "none";
+        document.getElementById("warmingControls").style.display = "none";
+      } else if (mode === "warming") {
+        quizBtn.style.display = "none";
+        quizUI.style.display = "none";
+        document.getElementById("controls").style.display = "none"; // 알베도 슬라이더 숨김
+        document.getElementById("summaryPanel").style.display = "flex";
+        atmToggleContainer.style.display = "none";
+        document.getElementById("warmingControls").style.display = "flex"; // 온난화 슬라이더 표시
+      }
+
+      render();
+    }
+
+    modeSelect.addEventListener("change", updateMode);
+
+    const checkBtn = quizUI.querySelector("#checkBtn");
+    checkBtn.onclick = () => {
+      const A = Number(document.getElementById("inputA").value);
+      const B = Number(document.getElementById("inputB").value);
+      const C = Number(document.getElementById("inputC").value);
+
+      const resA = document.getElementById("resA");
+      const resB = document.getElementById("resB");
+      const resC = document.getElementById("resC");
+
+      if (A === window.quizA) {
+        resA.textContent = "정답";
+        resA.style.color = "green";
+      } else {
+        resA.textContent = `오답 (정답: ${window.quizA})`;
+        resA.style.color = "red";
+      }
+
+      if (B === window.quizB) {
+        resB.textContent = "정답";
+        resB.style.color = "green";
+      } else {
+        resB.textContent = `오답 (정답: ${window.quizB})`;
+        resB.style.color = "red";
+      }
+
+      if (C === window.quizC) {
+        resC.textContent = "정답";
+        resC.style.color = "green";
+      } else {
+        resC.textContent = `오답 (정답: ${window.quizC})`;
+        resC.style.color = "red";
+      }
+    };
+
+    quizBtn.onclick = () => {
+      let atm, surf, totalRef;
+      const maxIter = 500;
+      let iter = 0;
+      do {
+        atm = Math.floor(Math.random() * 61);
+        surf = Math.floor(Math.random() * 41);
+        totalRef = atm + surf;
+        iter++;
+      } while ((totalRef >= 100) && iter < maxIter);
+
+      const totalAbs = 100 - totalRef;
+      let SA = 0;
+      let SS = 0;
+      if (totalAbs > 0) {
+        SA = Math.floor(Math.random() * (totalAbs + 1));
+        SS = totalAbs - SA;
+      }
+
+      let C = 0;
+      if (SS > 0) {
+        const ratio = 1.2 + Math.random() * 0.6;
+        C = Math.floor(SS * ratio);
+      }
+
+      quizAtmRef = atm;
+      quizSurfRef = surf;
+      quizB = SA;
+      quizC = C;
+      hasQuizData = true;
+
+      quizMaskTarget = Math.random() < 0.5 ? "atm" : "surf";
+      window.quizA = quizMaskTarget === "atm" ? atm : surf;
+      window.quizB = SA;
+      window.quizC = C;
+
+      atmSlider.value = atm;
+      surfSlider.value = surf;
+
+      document.getElementById("inputA").value = "";
+      document.getElementById("inputB").value = "";
+      document.getElementById("inputC").value = "";
+      document.getElementById("resA").textContent = "";
+      document.getElementById("resB").textContent = "";
+      document.getElementById("resC").textContent = "";
+
+      render();
+    };
+
+    // 초기 슬라이더 표시값 세팅 및 첫 렌더링
+    ghgVal.textContent = ghgSlider.value;
+    updateMode();
+  </script>
+</body>
+</html>
